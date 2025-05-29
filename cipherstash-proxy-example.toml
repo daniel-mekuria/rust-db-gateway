@@ -1,0 +1,29 @@
+[tls]
+type = "Path"                         # To provide paths to PEM files
+certificate = "tests/tls/server.cert"
+private_key = "tests/tls/server.key"
+
+# type = "Pem" # To directly provide PEM contents
+# certificate = """-----BEGIN CERTIFICATE-----
+# ...your certificate content here...
+# -----END CERTIFICATE-----
+# """
+# private_key = """-----BEGIN PRIVATE KEY-----
+# ...your private key content here...
+# -----END PRIVATE KEY-----
+# """
+
+[database]
+name = "cipherstash"
+username = "cipherstash"
+password = "password"
+with_tls = true
+
+[auth]
+workspace_crn = "workspace_crn"
+client_access_key = "client_access_key"
+
+[encrypt]
+default_keyset_id = "default_keyset_id"
+client_id = "client_id"
+client_key = "client_key"

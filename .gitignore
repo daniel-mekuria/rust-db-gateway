@@ -1,0 +1,23 @@
+/target
+.DS_Store
+/cipherstash-proxy.toml
+/cipherstash-proxy.local.toml
+mise.local.toml
+tests/pg/data**
+.vscode
+
+rust-toolchain.toml
+.cargo/config.toml
+
+# release artifacts
+/cipherstash-proxy
+/packages/cipherstash-proxy/eql-version-at-build-time.txt
+/cipherstash-encrypt.sql
+/cipherstash-encrypt-uninstall.sql
+
+# credentials for local dev
+.env.proxy.docker
+
+## benchmark result data
+tests/benchmark/results/*.csv
+tests/benchmark/benchmark-*.png
