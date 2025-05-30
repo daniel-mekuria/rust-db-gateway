@@ -1,0 +1,51 @@
+services:
+  postgres: &postgres
+    image: postgres:latest
+    container_name: postgres
+    environment:
+      PGPORT: 5432
+      POSTGRES_DB: "cipherstash"
+      POSTGRES_USER: "cipherstash"
+      PGUSER: "cipherstash"
+      POSTGRES_PASSWORD: 3ncryp7
+    ports:
+      - 5432:5432
+    networks:
+      - cipherstash
+    deploy:
+      resources:
+        limits:
+          cpus: "${CPU_LIMIT:-2}"
+          memory: 2048mb
+    restart: always
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready"]
+      interval: 1s
+      timeout: 5s
+      retries: 10
+
+  proxy:
+    image: cipherstash/proxy:latest
+    pull_policy: always
+    container_name: proxy
+    ports:
+      - 6432:6432
+      - 9930:9930
+    env_file:
+      - .env.proxy.docker
+    environment:
+      - CS_DATABASE__NAME=cipherstash
+      - CS_DATABASE__USERNAME=cipherstash
+      - CS_DATABASE__PASSWORD=3ncryp7
+      - CS_DATABASE__HOST=postgres
+      - CS_DATABASE__PORT=5432
+      - CS_PROMETHEUS__ENABLED=${CS_PROMETHEUS__ENABLED:-true}
+      - CS_DATABASE__INSTALL_EQL=true            # install EQL into the PostgreSQL database
+      - CS_DATABASE__INSTALL_EXAMPLE_SCHEMA=true # install example schema into the PostgreSQL database
+    networks:
+      - cipherstash
+
+networks:
+  cipherstash:
+    driver: bridge
+
