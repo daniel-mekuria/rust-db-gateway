@@ -1,0 +1,47 @@
+[env]
+CS_DATABASE__NAME = "cipherstash"
+CS_DATABASE__USERNAME = "cipherstash"
+CS_DATABASE__PASSWORD = "password"
+
+CS_DATABASE__HOST = "localhost" # optional
+CS_DATABASE__PORT = "5532"      # optional
+CS_DATABASE__WITH_TLS = false   # optional
+
+CS_WORKSPACE_CRN = "crn:workspace-crn"
+CS_CLIENT_ACCESS_KEY = "client-access-key"
+
+CS_DEFAULT_KEYSET_ID = "default-keyset-id"
+CS_CLIENT_KEY = "client-key"
+CS_CLIENT_ID = "client-id"
+
+# The release of EQL that the proxy tests will use and releases will be built with
+CS_EQL_VERSION="eql-1.0.0"
+
+# TLS variables are required for providing TLS to Proxy's clients.
+# CS_TLS__TYPE can be either "Path" or "Pem" (case-sensitive).
+# When TYPE is "Pem", CERTIFICATE and PRIVATE_KEY must contain
+# the respective .pem contents (starting with '-----BEGIN').
+# When TYPE is "Path", CERTIFICATE and PRIVATE_KEY must contain
+# the paths to the respoctive files.
+
+CS_TLS__CERTIFICATE_PATH = "tests/tls/server.cert"
+CS_TLS__PRIVATE_KEY_PATH = "tests/tls/server.key"
+
+
+# CS_TLS__CERTIFICATE_PEM = """-----BEGIN CERTIFICATE-----
+# ...your certificate content here...
+# -----END CERTIFICATE-----
+# """
+# CS_TLS__PRIVATE_KEY_PEM = """-----BEGIN PRIVATE KEY-----
+# ...your private key content here...
+# -----END PRIVATE KEY-----
+# """
+
+CS_LOG__DEVELOPMENT_LEVEL = "info"
+CS_LOG__AUTHENTICATION_LEVEL = "info"
+CS_LOG__CONTEXT_LEVEL = "info"
+CS_LOG__KEYSET_LEVEL = "info"
+CS_LOG__PROTOCOL_LEVEL = "info"
+CS_LOG__MAPPER_LEVEL = "debug"
+CS_LOG__SCHEMA_LEVEL = "info"
+CS_LOG__CONFIG_LEVEL = "info"

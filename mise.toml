@@ -1,0 +1,624 @@
+[settings]
+# Config for test environments
+# Can be invoked with: mise --env tcp run <task>
+trusted_config_paths = [
+  "./tests/mise.toml",
+  "./tests/mise.tcp.toml",
+  "./tests/mise.tls.toml",
+]
+
+[task_config]
+includes = ["tests/tasks"]
+
+
+[env]
+# Default configuration for running cipherstash-proxy out of the box
+CS_DATABASE__NAME = "cipherstash"
+CS_DATABASE__USERNAME = "cipherstash"
+
+# Why not have several passwords!?
+# Proxy uses the password as a string.
+# PSQL connection strings require an escaped password, rather than change all the code to escape the password, I did this. Apologies in advance
+CS_DATABASE__PASSWORD = 'p@ssword'
+CS_DATABASE__PASSWORD_ESCAPED_FOR_TESTS = 'p%40ssword'
+
+CS_DATABASE__HOST = "localhost"
+CS_DATABASE__PORT = "5532"
+# CS_DATABASE__PORT = "5617"
+
+# Default configuration for dev cipherstash-proxy run using 'mise run proxy:up'
+CS_PROXY__HOST = "proxy"
+# Misc
+DOCKER_CLI_HINTS = "false" # Please don't show us What's Next.
+
+CS_EQL_VERSION = "eql-2.0.4"
+
+[tools]
+"cargo:cargo-binstall" = "latest"
+"cargo:cargo-nextest" = "latest"
+"cargo:cargo-sort" = "latest"
+
+# ====================================================================================================
+# Proxy Tasks
+[tasks.proxy]
+alias = 'p'
+description = "Run the proxy (with `cargo run`)"
+run = 'pwd && env | grep CS_ && echo cargo run {{option(name="extra-args",default="")}} | bash'
+
+[tasks."proxy:kill"]
+alias = 'k'
+description = "Kill running cipherstash-proxy processes"
+run = """
+  set +e
+  killall cipherstash-proxy -s SIGINT
+  exit 0
+"""
+
+[tasks."proxy:up"]
+description = "Run Proxy instance with docker compose"
+dir = "{{config_root}}/tests"
+run = """
+#!/bin/bash
+
+# Exit immediately if any command returns non-zero. Stops proxy from starting when the build fails
+set -e
+
+{% set target = arch() ~ "-unknown-linux-gnu" | replace(from="arm64", to="aarch64") | replace(from="x64", to="x86_64") %}
+{% set docker_platform = "linux/" ~ arch() | replace(from="x64", to="amd64") %}
+
+# build a binary
+mise run build:binary --target {{target}}
+
+# build a new container
+mise run build:docker --platform {{docker_platform}}
+
+
+# Make the default invocation with `mise run proxy:up` work.
+# The default mise environment configuration works for Proxy running as a process, connecting via a port forward.
+# Try detecting a running postgres, and use it
+if [ "${CS_DATABASE__HOST}" == "localhost" ]; then
+  {% raw %}
+  running_postgres="$(docker ps --filter "name=postgres" --filter "health=healthy" --format "{{.Names}};{{.Ports}}" | grep ${CS_DATABASE__PORT})"
+  {% endraw %}
+  if [ -z "${running_postgres}" ]; then
+    echo "error: Could not detect a running, healthy postgres container with port ${CS_DATABASE__PORT}"
+    echo "error: Try running 'mise run postgres:up' to start a container"
+    exit 68
+  fi
+  echo $running_postgres
+  export CS_DATABASE__HOST=$(echo $running_postgres | cut -d ';' -f 1)
+  echo "Using postgres running in container: ${CS_DATABASE__HOST}"
+fi
+
+# run the container
+echo docker compose up {{arg(name="service",default="proxy")}} {{option(name="extra-args",default="")}} | bash
+"""
+
+[tasks."proxy:psql"]
+description = "Run psql (interactively) against the proxy; assumes the proxy is already up"
+alias = "psql"
+run = """
+set -eu
+docker exec -it postgres${CONTAINER_SUFFIX:-} psql "postgresql://${CS_DATABASE__USERNAME}:${CS_DATABASE__PASSWORD_ESCAPED_FOR_TESTS}@${CS_PROXY__HOST}:6432/${CS_DATABASE__NAME}"
+"""
+
+[tasks."proxy:local:psql"]
+description = "Run psql (interactively) against a local (non docker) proxy; assumes the proxy is already up"
+alias = "lpsql"
+run = """
+set -eu
+psql "postgresql://${CS_DATABASE__USERNAME}:${CS_DATABASE__PASSWORD_ESCAPED_FOR_TESTS}@localhost:6432/${CS_DATABASE__NAME}"
+"""
+
+[tasks."proxy:down"]
+dir = "{{config_root}}/tests"
+description = "Tear down Proxy containers"
+# `docker compose down` works differently on Linux and macOS.
+# Depending on the operating system and version, services sometimes can't be named.
+# Run `docker compose rm` directly, to emulate what `docker compose down` does.
+run = "docker compose rm --stop --force proxy proxy-tls"
+
+# ====================================================================================================
+# Test Tasks
+
+[tasks.test]
+alias = ['t', 'ci']
+description = "Runs all tests (hygiene, unit, integration)"
+run = """
+mise run rust:version
+mise run test:check
+mise run test:format
+mise run test:clippy
+mise run test:unit
+mise run test:integration
+"""
+
+[tasks."reset"]
+alias = 'r'
+description = "Reset database"
+run = """
+mise run postgres:down
+mise run postgres:up --extra-args "--detach --wait"
+mise run postgres:setup
+"""
+
+[tasks."test:local:unit"]
+alias = 'lu'
+description = "Runs test/s"
+run = """
+cargo nextest run --no-fail-fast --nocapture -p cipherstash-proxy
+"""
+
+[tasks."test:local:integration"]
+alias = 'li'
+description = "Runs test/s"
+run = """
+cargo nextest run --no-fail-fast --nocapture -p cipherstash-proxy-integration
+"""
+
+[tasks."test:local:mapper"]
+alias = 'lm'
+description = "Runs test/s"
+run = """
+cargo nextest run --no-fail-fast --nocapture -p eql-mapper
+"""
+
+[tasks."test:unit"]
+description = "Runs test/s"
+run = "mise run test:nextest {{arg(name='test',default='')}}"
+
+
+[tasks."test:wait_for_postgres_to_quack"]
+dir = "{{config_root}}"
+run = """
+{% set default_host = get_env(name="CS_DATABASE__HOST",default="localhost") %}
+{% set default_port = get_env(name="CS_DATABASE__PORT",default=5432) %}
+host={{option(name="host",default=default_host)}}
+port={{option(name="port",default=default_port)}}
+tls={{flag(name="tls")}}
+max_retries={{option(name="max-retries",default="4")}}
+interval={{option(name="interval",default="0.5")}}
+attempt=1
+echo "Testing presence of Postgres at ${host}:${port} with a maximum of ${max_retries} retries"
+
+postgres_ready () {
+  # tls test
+  if [ "$1" = "true" ]; then
+    response="$(echo | openssl s_client -starttls postgres -connect $host:$port -state -no_ign_eof 2>&1)"
+    success=$?
+    if [ -n "${DEBUG}" ]; then
+      echo "response: ${response}"
+    fi
+    return $success
+  else
+    # plaintext test
+    # We blackhole stderr (2>/dev/null) below because nc is echoing to stderr,
+    # and that *sometimes* gets mise in a tizz. (There's some condition we're
+    # triggering in [at least] Mise v2025.1.6, and accordingly need to avoid
+    # echoing the raw response out to stdout or stderr without putting it
+    # through od or similar.)
+    response=$(cat tests/pg/startup_message.bin | nc -v -w 1 $host $port 2>/dev/null)
+    if [ -n "${DEBUG}" ]; then
+      echo "response:"
+      printf "%s" "${response}" | od -c
+      echo "number of response bytes:"
+      printf "%s" "${response}" | wc -c
+    fi
+    # FIXME(lindsay): also detect if we see TLS failures
+    if [ -n "${response}" ]; then
+      return 0
+    fi
+    return 1
+  fi
+}
+
+until postgres_ready $tls
+do
+  if [ $attempt -lt $max_retries ]; then
+    echo "Waiting for ${host}:${port}"
+    sleep $interval
+    attempt=$(expr $attempt + 1)
+  else
+    echo "Unable to connect to ${host}:${port} after ${max_retries} attempts"
+    exit 64
+  fi
+done
+echo "Connected to ${host}:${port} after ${attempt} attempts"
+"""
+
+[tasks."test:integration:preflight"]
+description = "Ensure dependencies are ready for running the integration tests"
+run = '''
+set -u
+set +e
+
+# 5532: non-TLS, Postgres latest
+# 5617: TLS, PostgreSQL version 17
+ports="5532 5617"
+
+for i in ${ports}; do
+  # 55xx ports are always non-TLS, 56xx ports are always TLS
+  TLS=""
+  if [ "$i" -gt 5600 ] && [ "$i" -le 5699 ]; then
+    TLS="--tls"
+  fi
+
+  mise run test:wait_for_postgres_to_quack --port ${i} --max-retries 20 ${TLS}
+  if [ $? -ne 0 ]; then
+    echo "error: Postgres not running on port ${i}"
+    echo "error: Try running 'mise run postgres:up' to start the containers"
+    exit 66
+  fi
+done
+
+# Ensure all Proxy services are stopped before we start the tests
+mise --env tcp run proxy:down
+'''
+
+[tasks."test:integration"]
+alias = "i"
+dir = "./tests"
+description = "Runs integration test/s"
+run = """
+set -e
+
+echo
+echo '###############################################'
+echo '# Preflight'
+echo '###############################################'
+echo
+
+# Ensure Postgres instances are running
+mise run test:integration:preflight
+
+echo
+echo '###############################################'
+echo '# Test: unconfigured proxy'
+echo '###############################################'
+echo
+
+mise --env tcp run postgres:eql:teardown
+mise --env tcp run proxy:up proxy --extra-args "--detach --wait"
+mise --env tcp run test:wait_for_postgres_to_quack --port 6432 --max-retries 20
+mise --env tcp run test:integration:psql-passthrough
+mise --env tcp run proxy:down
+
+echo
+echo '###############################################'
+echo '# Setup'
+echo '###############################################'
+echo
+
+# Ensure EQL is set up before we try and start Proxy
+mise --env tcp run postgres:setup
+mise --env tls run postgres:setup
+
+echo
+echo '###############################################'
+echo '# Test: Prometheus'
+echo '###############################################'
+echo
+
+mise --env tcp run proxy:up proxy --extra-args "--detach --wait"
+mise --env tcp run test:wait_for_postgres_to_quack --port 6432 --max-retries 20
+mise --env tcp run test:integration:prometheus
+mise --env tcp run proxy:down
+
+echo
+echo '###############################################'
+echo '# Test: non-TLS'
+echo '###############################################'
+echo
+
+mise --env tcp run proxy:up proxy --extra-args "--detach --wait"
+mise --env tcp run test:wait_for_postgres_to_quack --port 6432 --max-retries 20
+mise --env tcp run test:integration:psql-tcp
+mise --env tcp run proxy:down
+
+echo
+echo '###############################################'
+echo '# Test: TLS'
+echo '###############################################'
+echo
+
+mise --env tls run proxy:up proxy-tls --extra-args "--detach --wait"
+mise --env tls run test:wait_for_postgres_to_quack --port 6432 --max-retries 20 --tls
+mise --env tls run test:integration:psql-tls
+mise --env tls run proxy:down
+
+
+echo
+echo '###############################################'
+echo '# Test: Integration'
+echo '###############################################'
+echo
+
+mise --env tls run proxy:up proxy-tls --extra-args "--detach --wait"
+mise --env tls run test:wait_for_postgres_to_quack --port 6432 --max-retries 20 --tls
+cargo nextest run --no-fail-fast --nocapture -E 'package(cipherstash-proxy-integration)'
+mise --env tls run proxy:down
+"""
+
+[tasks."test:nextest"]
+description = "Runs cargo nextest, skipping integration tests"
+run = 'cargo nextest run --no-fail-fast --nocapture -E "not package(cipherstash-proxy-integration)" {{arg(name="test",default="")}}'
+
+[tasks."rust:version"]
+description = "Outputs rust toolchain version info"
+run = """
+echo "rustc --version         = " $(rustc --version)
+echo "cargo --version         = " $(cargo --version)
+echo "cargo fmt --version     = " $(cargo fmt --version)
+echo "cargo clippy --version  = " $(cargo clippy --version)
+"""
+
+[tasks."test:format"]
+description = "Runs cargo fmt"
+run = 'cargo fmt --all -- --check'
+
+[tasks."test:check"]
+description = "Runs cargo check to check types and dependencies"
+run = """
+# Assert that `Cargo.lock` will remain unchanged
+cargo check --locked
+
+# Check types of packages and dependencies"
+cargo check
+"""
+
+[tasks."test:clippy"]
+description = "Runs clippy"
+run = 'cargo clippy --all --no-deps --all-targets --all-features -- -D warnings'
+
+[tasks."postgres:fail_if_not_running"]
+description = "Check if postgres containers are running, and fail if not"
+run = """
+containers=$(docker ps --filter "name=postgres${CONTAINER_SUFFIX}" --quiet)
+if [ -z "${containers}" ]; then
+  echo "error: Docker containers for PostgreSQL are not running"
+  echo "error: Try running 'mise run postgres:up' to start the containers"
+  exit 65
+fi
+"""
+
+[tasks."postgres:setup"]
+depends = ["postgres:eql:teardown"]
+alias = 's'
+description = "Installs EQL and applies schema to database"
+run = """
+#!/bin/bash
+cd tests
+mise run postgres:fail_if_not_running
+cat sql/schema-uninstall.sql | docker exec -i postgres${CONTAINER_SUFFIX} psql postgresql://${CS_DATABASE__USERNAME}:${CS_DATABASE__PASSWORD_ESCAPED_FOR_TESTS}@${CS_DATABASE__HOST}:${CS_DATABASE__PORT}/${CS_DATABASE__NAME} -f-
+cat ../cipherstash-encrypt-uninstall.sql | docker exec -i postgres${CONTAINER_SUFFIX} psql postgresql://${CS_DATABASE__USERNAME}:${CS_DATABASE__PASSWORD_ESCAPED_FOR_TESTS}@${CS_DATABASE__HOST}:${CS_DATABASE__PORT}/${CS_DATABASE__NAME} -f-
+cat ../cipherstash-encrypt.sql | docker exec -i postgres${CONTAINER_SUFFIX} psql postgresql://${CS_DATABASE__USERNAME}:${CS_DATABASE__PASSWORD_ESCAPED_FOR_TESTS}@${CS_DATABASE__HOST}:${CS_DATABASE__PORT}/${CS_DATABASE__NAME} -f-
+cat sql/schema.sql | docker exec -i postgres${CONTAINER_SUFFIX} psql postgresql://${CS_DATABASE__USERNAME}:${CS_DATABASE__PASSWORD_ESCAPED_FOR_TESTS}@${CS_DATABASE__HOST}:${CS_DATABASE__PORT}/${CS_DATABASE__NAME} -f-
+"""
+
+[tasks."postgres:eql:teardown"]
+depends = ["eql:download"]
+description = "Uninstalls EQL and removes schema from database"
+run = """
+#!/bin/bash
+cd tests
+mise run postgres:fail_if_not_running
+cat sql/schema-uninstall.sql | docker exec -i postgres${CONTAINER_SUFFIX} psql postgresql://${CS_DATABASE__USERNAME}:${CS_DATABASE__PASSWORD_ESCAPED_FOR_TESTS}@${CS_DATABASE__HOST}:${CS_DATABASE__PORT}/${CS_DATABASE__NAME} -f-
+cat ../cipherstash-encrypt-uninstall.sql | docker exec -i postgres${CONTAINER_SUFFIX} psql postgresql://${CS_DATABASE__USERNAME}:${CS_DATABASE__PASSWORD_ESCAPED_FOR_TESTS}@${CS_DATABASE__HOST}:${CS_DATABASE__PORT}/${CS_DATABASE__NAME} -f-
+"""
+
+[tasks."postgres:up"]
+alias = 'u'
+dir = "{{config_root}}/tests"
+description = "Run Postgres instances with docker compose"
+run = """
+set -e
+# Start the containers
+echo docker compose up --build {{arg(name="service",default="postgres postgres-17-tls")}} {{option(name="extra-args",default="")}} | bash
+"""
+
+[tasks."postgres:psql"]
+description = "Run psql (interactively) against the Postgres instance; assumes Postgres is already up"
+run = """
+set -eu
+docker exec -it postgres${CONTAINER_SUFFIX:-} psql "postgresql://${CS_DATABASE__USERNAME}:${CS_DATABASE__PASSWORD_ESCAPED_FOR_TESTS}@${CS_DATABASE__HOST}:${CS_DATABASE__PORT}/${CS_DATABASE__NAME}"
+"""
+
+[tasks."postgres:down"]
+alias = 'd'
+description = 'Tear down containers and destroy all data'
+run = """
+  mise run postgres:compose_down
+  mise run postgres:destroy_data
+"""
+
+[tasks."postgres:compose_down"]
+dir = "./tests"
+description = "docker compose down"
+run = 'docker compose down'
+
+[tasks."postgres:destroy_data"]
+alias = 'dd'
+dir = "{{config_root}}"
+description = "Removes the local data directories"
+run = """
+{% if os() == "linux" %}
+{% set stat_cmd = "stat --format='%u'" %}
+{% else %}
+{% set stat_cmd = "stat -f '%Uu'" %}
+{% endif %}
+set -e
+set -u
+if test -z "$(find tests/pg -maxdepth 1 -name 'data-*' -print -quit)"; then
+  echo "no data directories to clean up - skipping"
+  exit 0
+fi
+
+uid=$(id -u)
+for d in tests/pg/data-*; do
+  sudo=""
+  if [ "$({{stat_cmd}} ${d})" != "${uid}" ]; then
+    sudo="sudo"
+  fi
+  echo "removing data directory ${d}"
+  ${sudo} rm -rf ${d}
+done
+"""
+
+[tasks."eql:download"]
+alias = 'e'
+description = "Download latest EQL release or use local copy"
+dir = "{{config_root}}/tests"
+outputs = [
+  "{{config_root}}/cipherstash-encrypt.sql",
+  "{{config_root}}/cipherstash-encrypt-uninstall.sql",
+]
+run = """
+# install script
+if [ -z "$CS_EQL_PATH" ]; then
+  echo "Downloading ${CS_EQL_VERSION} install"
+  curl -sLo "{{config_root}}/cipherstash-encrypt.sql" https://github.com/cipherstash/encrypt-query-language/releases/download/${CS_EQL_VERSION}/cipherstash-encrypt.sql
+else
+  echo "Using EQL: ${CS_EQL_PATH}/cipherstash-encrypt.sql"
+  cp "$CS_EQL_PATH/cipherstash-encrypt.sql" "{{config_root}}/cipherstash-encrypt.sql"
+fi
+
+# uninstall script
+if [ -z "$CS_EQL_PATH" ]; then
+  echo "Downloading ${CS_EQL_VERSION} uninstall"
+  curl -sLo   "{{config_root}}/cipherstash-encrypt-uninstall.sql" https://github.com/cipherstash/encrypt-query-language/releases/download/${CS_EQL_VERSION}/cipherstash-encrypt-uninstall.sql
+else
+  echo "Using EQL: ${CS_EQL_PATH}/cipherstash-encrypt-uninstall.sql"
+  cp "$CS_EQL_PATH/cipherstash-encrypt-uninstall.sql"   "{{config_root}}/cipherstash-encrypt-uninstall.sql"
+fi
+"""
+
+[tasks."python:test"]
+dir = "{{config_root}}/tests"
+description = "Runs python tests"
+run = """
+set -e
+echo docker compose run --rm --no-TTY --build python {{option(name="extra-args",default="")}} | bash
+"""
+
+[tasks.build]
+description = "Build releasable artifacts"
+run = """
+{# Target for rust build #}
+{% set default_target_arch = arch() | replace(from="arm64", to="aarch64") | replace(from="x64", to="x86_64") %}
+{% set default_target_os = os() | replace(from="linux", to="unknown-linux-gnu") | replace(from="macos", to="apple-darwin") %}
+{% set default_target = default_target_arch ~ "-" ~ default_target_os %}
+
+{# Platform for Docker image build #}
+{% set default_platform = "linux/" ~ arch() | replace(from="x86_64", to="amd64") %}
+
+mise run build:binary --target {{option(name="target", default=default_target)}}
+mise run build:docker --platform {{option(name="platform",default=default_platform)}}
+"""
+
+[tasks."build:binary"]
+description = "Build a releasable binary for cipherstash-proxy"
+run = """
+#!/bin/bash
+
+# Exit immediately if any command returns a non-zero value
+set -e
+
+{% set default_target_arch = arch() | replace(from="arm64", to="aarch64") | replace(from="x64", to="x86_64") %}
+{% set default_target_os = os() | replace(from="linux", to="unknown-linux-gnu") | replace(from="macos", to="apple-darwin") %}
+{% set default_target = default_target_arch ~ "-" ~ default_target_os %}
+{% set target = option(name="target", default=default_target) %}
+
+{# If we are on macos and are cross-compiling for Linux, set up a linker and toolchain. #}
+{# Only supports cross-compiling to Linux/ARM64. #}
+{% if os() == "macos" %}
+if [[ "{{option(name="target", default=default_target)}}" =~ "linux" ]]; then
+  if ! which {{ target }}-gcc ; then
+    brew install MaterializeInc/crosstools/aarch64-unknown-linux-gnu
+  fi
+  export CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER={{ target }}-gcc
+fi
+{% endif %}
+
+# cross-compile
+rustup target add --toolchain stable {{ target }}
+
+cargo build --locked --target {{ target }} --release --package cipherstash-proxy
+
+cp -v {{config_root}}/target/{{ target }}/release/cipherstash-proxy {{config_root}}/
+"""
+
+[tasks."build:docker"]
+depends = ["eql:download"]
+description = "Build a Docker image for cipherstash-proxy"
+run = """
+{% set default_platform = "linux/" ~ arch() | replace(from="x86_64", to="amd64") %}
+[ -n "${DEBUG}" ] && PROGRESS_FLAG="--progress=plain" || PROGRESS_FLAG=""
+
+docker build . \
+  --tag cipherstash/proxy:latest \
+  --file proxy.Dockerfile \
+  ${PROGRESS_FLAG} \
+  --platform {{option(name="platform",default=default_platform)}} \
+"""
+
+[tasks."build:docker:fetch_eql"]
+description = "Fetch the EQL installation script"
+run = """
+if [ ! -e "cipherstash-eql.sql" ]; then
+  echo "Fetching: cipherstash-eql.sql"
+  curl -sLo cipherstash-eql.sql https://github.com/cipherstash/encrypt-query-language/releases/download/${CS_EQL_VERSION}/cipherstash-encrypt.sql
+else
+  echo "Prefetched: cipherstash-eql.sql"
+fi
+"""
+
+[tasks.release]
+description = "Publish release artifacts"
+depends = ["release:docker"]
+
+[tasks."release:docker"]
+description = "Release a Docker image for cipherstash-proxy"
+run = """
+if [ -z "$DOCKER_HUB_USERNAME" ] || [ -z "$DOCKER_HUB_PERSONAL_ACCESS_TOKEN" ]; then
+  echo "error: no Docker Hub credentials provided"
+  echo "error: please set DOCKER_HUB_USERNAME and DOCKER_HUB_PERSONAL_ACCESS_TOKEN"
+  exit 2
+fi
+echo "Logging in to Docker Hub..."
+echo $DOCKER_HUB_PERSONAL_ACCESS_TOKEN | docker login --username $DOCKER_HUB_USERNAME --password-stdin
+docker tag cipherstash/proxy:latest cipherstash/proxy:latest
+docker push cipherstash/proxy:latest
+"""
+
+[tasks."release:aws-marketplace"]
+description = "Release a Docker image to AWS Marketplace for cipherstash-proxy"
+run = """
+if [ -z "$AWS_MARKETPLACE_ECR_REPOSITORY" ]; then
+  echo "error: no AWS ECR repository provided"
+  echo "error: please set AWS_MARKETPLACE_ECR_REPOSITORY"
+  exit 2
+fi
+
+# If release tag is empty, generate a build timestamp
+# Release tag is set when tagging as an actual version github release.
+if [ -z "$RELEASE_TAG" ]; then
+  RELEASE_TAG=build-$(date +%s)
+fi
+
+echo $AWS_MARKETPLACE_ECR_REPOSITORY:proxy-$BUILD_TAG-$RELEASE_TAG
+
+docker tag cipherstash/proxy:latest $AWS_MARKETPLACE_ECR_REPOSITORY:proxy-$BUILD_TAG-$RELEASE_TAG
+
+docker push $AWS_MARKETPLACE_ECR_REPOSITORY:proxy-$BUILD_TAG-$RELEASE_TAG
+"""
+
+# ====================================================================================================
+
+
+[tasks.cert]
+description = "Regenerate server certs"
+dir = "{{config_root}}/tests/tls"
+run = """
+  openssl req -new -x509 -days 365 -nodes -out server.cert -keyout server.key -subj "/CN=localhost"
+  chmod 600 server.cert server.key
+"""

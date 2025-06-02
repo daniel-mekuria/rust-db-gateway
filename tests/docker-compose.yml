@@ -1,0 +1,166 @@
+services:
+  postgres: &postgres
+    image: postgres:latest
+    container_name: postgres
+    command: -c 'config_file=/etc/postgresql/postgresql.conf'
+    restart: always
+    environment:
+      PGPORT: 5532
+    ports:
+      - 5532:5532
+    volumes:
+      - ./pg/postgresql.conf:/etc/postgresql/postgresql.conf
+      - ./benchmark/sql/:/etc/postgresql/benchmark/sql
+      - ./pg/data-latest:/var/lib/postgresql/data
+    env_file:
+      - ./pg/common.env
+    networks:
+      - postgres
+    extra_hosts:
+      - host.docker.internal:host-gateway
+    deploy:
+      resources:
+        limits:
+          cpus: ${CPU_LIMIT_POSTGRES:-4}
+          memory: ${CONTAINER_RAM_LIMIT_POSTGRES:-4g}
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready"]
+      interval: 1s
+      timeout: 5s
+      retries: 10
+
+  postgres-17-tls:
+    <<: *postgres
+    image: postgres:17
+    container_name: postgres-17-tls
+    environment:
+      PGPORT: 5617
+    ports:
+      - 5617:5617
+    command: |
+      sh -c 'chown postgres:postgres /etc/postgresql/localhost*.pem && chmod 0600 /etc/postgresql/localhost*.pem && exec docker-entrypoint.sh -c ssl=on -c ssl_cert_file=/etc/postgresql/localhost.pem -c ssl_key_file=/etc/postgresql/localhost-key.pem -c hba_file=/etc/postgresql/pg_hba.conf'
+    volumes:
+      - ./pg/pg_hba-tls.conf:/etc/postgresql/pg_hba.conf
+      - ./tls/localhost-key.pem:/etc/postgresql/localhost-key.pem
+      - ./tls/localhost.pem:/etc/postgresql/localhost.pem
+      - ./pg/data-17:/var/lib/postgresql/data
+
+  proxy:
+    image: cipherstash/proxy:latest
+    container_name: proxy
+    ports:
+      - 6432:6432
+      - 9930:9930
+    environment:
+      - CS_DATABASE__NAME=${CS_DATABASE__NAME}
+      - CS_DATABASE__USERNAME=${CS_DATABASE__USERNAME}
+      - CS_DATABASE__PASSWORD=${CS_DATABASE__PASSWORD}
+      - CS_DATABASE__HOST=${CS_DATABASE__HOST}
+      - CS_DATABASE__PORT=${CS_DATABASE__PORT}
+      - CS_CLIENT_ACCESS_KEY=${CS_CLIENT_ACCESS_KEY}
+      - CS_DEFAULT_KEYSET_ID=${CS_DEFAULT_KEYSET_ID}
+      - CS_CLIENT_KEY=${CS_CLIENT_KEY}
+      - CS_CLIENT_ID=${CS_CLIENT_ID}
+      - CS_PROMETHEUS__ENABLED=${CS_PROMETHEUS__ENABLED:-true}
+      - CS_SERVER__WORKER_THREADS=${CS_SERVER__WORKER_THREADS:-4}
+      - CS_WORKSPACE_CRN=${CS_WORKSPACE_CRN}
+    networks:
+      - postgres
+    deploy:
+      resources:
+        limits:
+          cpus: ${CPU_LIMIT_PROXY:-4}
+          memory: ${CONTAINER_RAM_LIMIT_PROXY:-8g}
+    cap_add:
+      - CAP_PERFMON
+      - SYS_ADMIN
+    security_opt:
+      - seccomp:unconfined
+    stop_grace_period: 30s
+    stop_signal: SIGKILL # SIGTERM is the default signal
+
+  proxy-tls:
+    image: cipherstash/proxy:latest
+    container_name: proxy
+    ports:
+      - 6432:6432
+    environment:
+      - CS_DATABASE__NAME=${CS_DATABASE__NAME}
+      - CS_DATABASE__USERNAME=${CS_DATABASE__USERNAME}
+      - CS_DATABASE__PASSWORD=${CS_DATABASE__PASSWORD}
+      - CS_DATABASE__HOST=${CS_DATABASE__HOST}
+      - CS_DATABASE__PORT=${CS_DATABASE__PORT}
+      - CS_CLIENT_ACCESS_KEY=${CS_CLIENT_ACCESS_KEY}
+      - CS_DEFAULT_KEYSET_ID=${CS_DEFAULT_KEYSET_ID}
+      - CS_CLIENT_KEY=${CS_CLIENT_KEY}
+      - CS_CLIENT_ID=${CS_CLIENT_ID}
+      - CS_TLS__CERTIFICATE_PATH=${CS_TLS__CERTIFICATE:-/etc/cipherstash-proxy/server.cert}
+      - CS_TLS__PRIVATE_KEY_PATH=${CS_TLS__PRIVATE_KEY:-/etc/cipherstash-proxy/server.key}
+      - CS_SERVER__REQUIRE_TLS=true
+      - CS_PROMETHEUS__ENABLED=${CS_PROMETHEUS__ENABLED:-true}
+      - CS_WORKSPACE_CRN=${CS_WORKSPACE_CRN}
+
+    volumes:
+      - ./tls/server.cert:/etc/cipherstash-proxy/server.cert
+      - ./tls/server.key:/etc/cipherstash-proxy/server.key
+    networks:
+      - postgres
+
+  python:
+    image: test/python
+    build:
+      context: ./python
+      dockerfile: Dockerfile
+      target: test
+    container_name: python-tests
+    environment:
+      - CS_DATABASE__NAME=${CS_DATABASE__NAME}
+      - CS_DATABASE__USERNAME=${CS_DATABASE__USERNAME}
+      - CS_DATABASE__PASSWORD=${CS_DATABASE__PASSWORD}
+      - CS_DATABASE__HOST=proxy-tls
+      - CS_DATABASE__PORT=6432
+    networks:
+      - postgres
+
+  pgbouncer:
+    image: pgbouncer
+    container_name: pgbouncer
+    ports:
+      - 6433:6433
+    pull_policy: build
+    build: ./benchmark/docker/pgbouncer
+    networks:
+      - postgres
+    extra_hosts:
+      - host.docker.internal:host-gateway
+    deploy:
+      resources:
+        limits:
+          cpus: ${CPU_LIMIT_PGBOUNCER:-4}
+          memory: ${CONTAINER_RAM_LIMIT_PGBOUNCER:-8g}
+
+  pgcat:
+    image: ghcr.io/postgresml/pgcat:v1.2.0
+    container_name: pgcat
+    pull_policy: always
+    ports:
+      - 6434:6434
+    command:
+      - pgcat
+      - /etc/pgcat/pgcat.toml
+    volumes:
+      - ./benchmark/docker/pgcat/pgcat.toml:/etc/pgcat/pgcat.toml
+    networks:
+      - postgres
+    extra_hosts:
+      - host.docker.internal:host-gateway
+    deploy:
+      resources:
+        limits:
+          cpus: ${CPU_LIMIT_PGCAT:-4}
+          memory: ${CONTAINER_RAM_LIMIT_PGCAT:-8g}
+
+networks:
+  postgres:
+    driver: bridge
+
